@@ -4,6 +4,8 @@ A Retrieval-Augmented Generation (RAG) system that answers questions over arbitr
 
 Built and run end-to-end in Google Colab.
 
+
+
 Overview
 
 Most RAG pipelines treat a PDF as a flat wall of text. This one doesn't:
@@ -14,26 +16,11 @@ Images captioned with Gemini and indexed as searchable text, so image content is
 Hybrid retrieval — combines vector similarity search (semantic) with BM25 (keyword), then reranks candidates with a cross-encoder for precision.
 Structure-aware context expansion — pulls in neighboring chunks from the same section (for text) or sibling rows from the same table (for table hits), so the LLM gets coherent context instead of isolated fragments.
 Every answer comes with its source sections and page numbers, so results are traceable back to the original document.
-Architecture
-PDF
- │
- ├─► Docling parses document tree
- │
- ├─► Structure-aware chunking (single pass)
- │     ├─ Text/headings → tagged with full section breadcrumb
- │     ├─ Tables → split row-by-row, tagged with parent section
- │     └─ Images → captioned via Gemini, indexed as text
- │
- ├─► Indexing
- │     ├─ ChromaDB (vector embeddings — semantic search)
- │     └─ BM25 (keyword search)
- │
- ├─► Query time
- │     ├─ Hybrid search (vector + BM25, weighted & normalized)
- │     ├─ Cross-encoder reranking (top-k precision)
- │     └─ Structure-aware context expansion
- │
- └─► Answer generation (Groq / LLaMA) → answer + cited sources
+
+
+
+
+  
 Tech Stack
 Tool	Purpose
 Docling	Parses PDF structure — headings, tables, images
@@ -51,6 +38,12 @@ Retrieve — a query triggers hybrid search (vector + keyword), and the top cand
 Expand context — matching chunks are expanded with neighboring context from the same section, or sibling rows from the same table.
 Answer — the assembled context is passed to the LLM, which answers strictly from the retrieved content, returning both the answer and its sources.
 Setup
+
+
+
+
+
+
 
 This notebook is designed to run in Google Colab.
 
