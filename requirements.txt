@@ -11,4 +11,5 @@ groq
 google-generativeai
 langfuse
 python-dotenv
+streamlit
 torch --index-url https://download.pytorch.org/whl/cpu
