@@ -1,55 +1,87 @@
-Multimodal RAG Pipeline
+# Multimodal RAG System — `multimodel_rag_clean_finall.py`
 
-A Retrieval-Augmented Generation (RAG) system that answers questions over arbitrary PDF documents — including their text, tables, and images — with hierarchy-aware chunking and source-traceable answers.
+Retrieval-Augmented Generation pipeline for PDFs with text, tables, headings, nested sections, and images.
 
-Built and run end-to-end in Google Colab.
+**Stack:** Docling + ChromaDB + BM25 + Cross-Encoder Reranker + Groq LLM + Langfuse
 
+## 1. Workflow Overview
 
+```
+PDFs → Docling Parse → Structure-Aware Chunking → ChromaDB + BM25 Index → Hybrid Search → Rerank → Context Expansion → Groq Answer
+                                                                                        ↘ Langfuse (observability only)
+```
 
-Overview
+## 2. Step-by-Step
 
-Most RAG pipelines treat a PDF as a flat wall of text. This one doesn't:
+### Step 1 — Setup
+- Embedding model: `sentence-transformers/all-MiniLM-L6-v2`
+- Reranker: `cross-encoder/ms-marco-MiniLM-L-6-v2`
+- Text LLM: Groq `openai/gpt-oss-20b` via `ChatGroq`
+- Vision: Groq `meta-llama/llama-4-scout-17b-16e-instruct` via `Groq()` for image captions
+- Keys from Colab Secrets: `GROQ_API_KEY`, `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`
 
-Structure-aware chunking — parses the document tree once and tracks nested headings (Section → Subsection → Sub-subsection) using a level-based stack, so every chunk knows its exact place in the document, not just "the last heading seen."
-Tables handled row-by-row, each row tagged with its correct parent section — not just dumped as raw text.
-Images captioned with Gemini and indexed as searchable text, so image content is retrievable through the same pipeline as everything else — no separate embedding model or vector space needed.
-Hybrid retrieval — combines vector similarity search (semantic) with BM25 (keyword), then reranks candidates with a cross-encoder for precision.
-Structure-aware context expansion — pulls in neighboring chunks from the same section (for text) or sibling rows from the same table (for table hits), so the LLM gets coherent context instead of isolated fragments.
-Every answer comes with its source sections and page numbers, so results are traceable back to the original document.
+### Step 2 — Upload & Parse PDFs (per user)
+- `current_user_id` isolates users. Each user gets own Chroma collection `user_{id}_chunks` via `get_user_store(user_id)`.
+- `files.upload()` → `pdf_paths`
+- `parse_pdf(pdf_path)` — `@observe(name="parse_pdf")`, uses `DocumentConverter` with `PdfPipelineOptions(images_scale=2.0, generate_page_images=True, generate_picture_images=True)`.
 
+### Step 3 — Structure-Aware Chunking
+Single pass in `build_document_index(doc, user_id, doc_id, doc_name)` — `@observe(name="build_document_index")`:
+- `Section` class + `heading_stack` tracks full breadcrumb `Section > Subsection`, not just last heading.
+- `classify(item)`: heading / table / picture / list_item / text using `label` + class name.
+- `get_page(item)`: from `item.prov[0].page_no`.
+- Heading → indexed as `type: heading` chunk.
+- Table → `export_to_dataframe()` → one chunk per row: `Table (Section: ...): col: val | ...`, `type: table_row`, with `table_id`, `row_index`.
+- Picture → `caption_image(item, doc, section)` — `@observe(name="caption_image")`, sends PNG to vision model, returns 1-3 sentence caption, indexed as `Image (Section: ...): caption`, `type: image_caption`.
+- Text/list → indexed if `len(text) >= 5`, with `section`, `page`.
+- Every chunk tagged with `user_id`, `doc_id`, `doc_name`.
 
+### Step 4 — Indexing
+`ingest_pdfs_for_user(user_id, pdf_paths)` — `@observe`:
+1. Skip already-ingested PDFs (`store["docs"]`).
+2. `parse_pdf` → `build_document_index` → `store["chunks"].extend(new_chunks)`.
+3. Embed all texts with `embedding_model.encode()`, clear + `collection.add(ids, documents, embeddings, metadatas)`.
+4. Build `BM25Okapi` over lowercased tokens.
+5. Build `chunk_by_element_id` (excludes `table_row` for neighbour lookup).
 
+`sanity_check_user()` prints counts by `type` and `doc_name`.
 
-  
-Tech Stack
-Tool	Purpose
-Docling	Parses PDF structure — headings, tables, images
-Sentence-Transformers (all-MiniLM-L6-v2)	Text embeddings for semantic search
-ChromaDB	Vector database for embedding storage & retrieval
-rank-bm25	Keyword-based (BM25) retrieval
-Cross-Encoder (ms-marco-MiniLM-L-6-v2)	Reranks retrieved candidates
-Groq (LLaMA 3.1)	Generates the final answer
-Gemini	Generates captions for images found in the PDF
-How It Works
-Parse — Docling reads the PDF and identifies headings, paragraphs, tables, and images.
-Chunk — the document tree is walked once. A heading stack tracks nesting depth, so every chunk (text, table row, image caption) is tagged with its full section path and page number.
-Index — all chunks are embedded and stored in ChromaDB, and also indexed with BM25 for keyword matching.
-Retrieve — a query triggers hybrid search (vector + keyword), and the top candidates are reranked with a cross-encoder.
-Expand context — matching chunks are expanded with neighboring context from the same section, or sibling rows from the same table.
-Answer — the assembled context is passed to the LLM, which answers strictly from the retrieved content, returning both the answer and its sources.
-Setup
+### Step 5 — Retrieval: Hybrid Search + Rerank
+- `hybrid_search(user_id, query, top_k=20)` — `@observe`: vector search (Chroma, `1/(1+dist)`) + BM25, min-max normalized, weighted `0.7 * vector + 0.3 * keyword`, sorted top_k.
+- `rerank_results(query, results, top_k=5)` — `@observe`: `CrossEncoder.predict([query, text])` → `rerank_score`, sorted top_k.
 
+### Step 6 — Context Expansion & Generation
+- `expand_context(user_id, reranked)`: table_row hits → pull sibling rows with same `table_id` + `doc_id` (max 8); other hits → pull neighbours `element_id ±2` with same `section` + `doc_id`.
+- `assemble_context(expanded, max_chars=10000)`: dedup, format `[Doc: ... | Section: ... | Page: ...]\ntext`.
+- `generate_answer(query, context)` — `@observe`: strict prompt `Answer ONLY from context, else say you don't know` → `llm.invoke(prompt).content`.
+- `ask(user_id, query)` — `@observe(name="ask")`: orchestrates hybrid → rerank → expand → assemble → generate, returns `{answer, context, sources}` + `langfuse.score(name="retrieved_chunks", value=len(reranked))`.
 
+## 3. What Langfuse Does (and Does NOT Do)
 
+**Does:**
+- Creates one trace for `ask`, with nested spans for `parse_pdf`, `build_document_index`, `caption_image`, `ingest_pdfs_for_user`, `hybrid_search`, `rerank_results`, `generate_answer`.
+- Logs inputs/outputs, latency, and error status + stacktrace per span.
+- Logs metric `retrieved_chunks` via `langfuse.score()`.
+- Viewable in dashboard at `https://cloud.langfuse.com`.
 
+**Does NOT:**
+- Handle / retry / fix a chunking error.
+- Respond to the user.
+- If `build_document_index` throws an uncaught exception, Langfuse just marks that span as failed — your code still crashes.
+- Table/image errors inside are `try/except + print + skip`, so they don't even appear as errors in Langfuse — that row/image is just skipped.
 
+If you want resilience, add your own `try/except` around chunking/ingestion.
 
+## 4. Run
 
-This notebook is designed to run in Google Colab.
+```python
+!pip install -q docling sentence-transformers rank-bm25 pandas chromadb langchain_groq google-generativeai langfuse
+# set GROQ_API_KEY, LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY in Colab Secrets
+ingest_pdfs_for_user("user_001", pdf_paths)
+result = ask("user_001", "your question")
+print(result["answer"])
+```
 
-Open the notebook in Colab.
-Add the following secrets via Colab's Secrets panel (key icon in the left sidebar):
-GROQ_API_KEY — from console.groq.com
-GEMINI_API_KEY — from aistudio.google.com
-Run all cells top to bottom. You'll be prompted to upload a PDF.
-Use the ask("your question") function at the end to query the document.
+## 5. Files
+- `multimodel_rag_clean_finall.py` — full pipeline (this README describes it)
+

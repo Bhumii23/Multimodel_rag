@@ -1,0 +1,14 @@
+fastapi
+uvicorn[standard]
+python-multipart
+docling
+sentence-transformers
+rank-bm25
+pandas
+chromadb
+langchain-groq
+groq
+google-generativeai
+langfuse
+python-dotenv
+torch --index-url https://download.pytorch.org/whl/cpu
